@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { NLQueryRequest, NLQueryResponse, TableInfo } from '@ai-data-assistant/shared';
 import logger from '../config/logger';
+import { MultiAgentService } from './multiagent';
 
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -13,6 +14,7 @@ const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({
 
 export class NLPService {
   private preferredProvider: 'openai' | 'anthropic' = 'anthropic';
+  private multiAgentService: MultiAgentService;
 
   constructor() {
     // Determine which provider to use based on available API keys
@@ -24,6 +26,9 @@ export class NLPService {
     } else {
       throw new Error('No AI provider API key found. Please set OPENAI_API_KEY or ANTHROPIC_API_KEY');
     }
+
+    // Inicializar sistema multiagente
+    this.multiAgentService = new MultiAgentService();
   }
 
   async processNaturalLanguageQuery(
@@ -31,43 +36,69 @@ export class NLPService {
     availableTables: TableInfo[]
   ): Promise<NLQueryResponse> {
     try {
-      const systemPrompt = this.buildSystemPrompt(availableTables);
-      const userPrompt = this.buildUserPrompt(request);
-
-      let response: string;
-
-      // Try preferred provider first, then fallback to the other
-      if (this.preferredProvider === 'openai' && openai) {
-        try {
-          response = await this.queryOpenAI(systemPrompt, userPrompt);
-        } catch (error) {
-          logger.warn('OpenAI failed, trying Anthropic:', error);
-          if (anthropic) {
-            response = await this.queryAnthropic(systemPrompt, userPrompt);
-          } else {
-            throw error;
-          }
+      logger.info('🔄 NLPService: Iniciando processamento com sistema multiagente');
+      
+      // Primeiro tentar usar o sistema multiagente (mais rápido e confiável)
+      try {
+        const multiAgentResponse = await this.multiAgentService.processQuery(request, availableTables);
+        
+        // Se a confiança for alta, usar a resposta do multiagente
+        if (multiAgentResponse.confidence >= 0.7) {
+          logger.info(`✅ NLPService: Usando resposta do multiagente (confiança: ${multiAgentResponse.confidence})`);
+          return multiAgentResponse;
         }
-      } else if (this.preferredProvider === 'anthropic' && anthropic) {
-        try {
-          response = await this.queryAnthropic(systemPrompt, userPrompt);
-        } catch (error) {
-          logger.warn('Anthropic failed, trying OpenAI:', error);
-          if (openai) {
-            response = await this.queryOpenAI(systemPrompt, userPrompt);
-          } else {
-            throw error;
-          }
-        }
-      } else {
-        throw new Error('No AI provider available');
+        
+        logger.info(`⚠️ NLPService: Confiança baixa do multiagente (${multiAgentResponse.confidence}), usando IA`);
+      } catch (multiAgentError) {
+        logger.warn('⚠️ NLPService: Multiagente falhou, usando IA tradicional:', multiAgentError);
       }
 
-      return this.parseAIResponse(response);
+      // Fallback para IA tradicional se multiagente falhar ou tiver confiança baixa
+      return await this.processWithTraditionalAI(request, availableTables);
+      
     } catch (error) {
-      logger.error('Error processing natural language query:', error);
+      logger.error('❌ NLPService: Erro no processamento:', error);
       throw new Error('Failed to process natural language query');
     }
+  }
+
+  private async processWithTraditionalAI(
+    request: NLQueryRequest,
+    availableTables: TableInfo[]
+  ): Promise<NLQueryResponse> {
+    const systemPrompt = this.buildSystemPrompt(availableTables);
+    const userPrompt = this.buildUserPrompt(request);
+
+    let response: string;
+
+    // Try preferred provider first, then fallback to the other
+    if (this.preferredProvider === 'openai' && openai) {
+      try {
+        response = await this.queryOpenAI(systemPrompt, userPrompt);
+      } catch (error) {
+        logger.warn('OpenAI failed, trying Anthropic:', error);
+        if (anthropic) {
+          response = await this.queryAnthropic(systemPrompt, userPrompt);
+        } else {
+          throw error;
+        }
+      }
+    } else if (this.preferredProvider === 'anthropic' && anthropic) {
+      try {
+        response = await this.queryAnthropic(systemPrompt, userPrompt);
+      } catch (error) {
+        logger.warn('Anthropic failed, trying OpenAI:', error);
+        if (openai) {
+          response = await this.queryOpenAI(systemPrompt, userPrompt);
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      throw new Error('No AI provider available');
+    }
+
+    return this.parseAIResponse(response);
   }
 
   private async queryOpenAI(systemPrompt: string, userPrompt: string): Promise<string> {
